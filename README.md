@@ -34,7 +34,7 @@ This agent continuously monitors cryptocurrency market data for multiple tokens,
 
 1. Clone the repository:
    ```
-   git clone [repository-url]
+   git clone Agent-Yugo
    ```
 
 2. Install dependencies:
