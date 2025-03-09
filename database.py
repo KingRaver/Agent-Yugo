@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 import json
 from typing import Dict, List, Optional, Union, Any, Tuple
@@ -15,17 +16,31 @@ class CryptoDatabase:
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         
         self.db_path = db_path
-        self.conn = None
-        self.cursor = None
+        self.local = threading.local()  # Thread-local storage
         self._initialize_database()
+    
+    @property
+    def conn(self):
+        """Thread-safe connection property - returns the connection for current thread"""
+        conn, _ = self._get_connection()
+        return conn
+        
+    @property
+    def cursor(self):
+        """Thread-safe cursor property - returns the cursor for current thread"""
+        _, cursor = self._get_connection()
+        return cursor
 
     def _get_connection(self):
-        """Get database connection, creating it if necessary"""
-        if not self.conn:
-            self.conn = sqlite3.connect(self.db_path)
-            self.conn.row_factory = sqlite3.Row
-            self.cursor = self.conn.cursor()
-        return self.conn, self.cursor
+        """Get database connection, creating it if necessary - thread-safe version"""
+        # Check if this thread has a connection
+        if not hasattr(self.local, 'conn') or self.local.conn is None:
+            # Create a new connection for this thread
+            self.local.conn = sqlite3.connect(self.db_path)
+            self.local.conn.row_factory = sqlite3.Row
+            self.local.cursor = self.local.conn.cursor()
+        
+        return self.local.conn, self.local.cursor
 
     def _initialize_database(self):
         """Create necessary tables if they don't exist"""
@@ -279,7 +294,43 @@ class CryptoDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_data_timestamp ON market_data(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_data_chain ON market_data(chain)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_content_timestamp ON posted_content(timestamp)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_content_timeframe ON posted_content(timeframe)")
+            
+            # HERE'S THE FIX: Check if timeframe column exists in posted_content before creating index
+            try:
+                # Try to get column info
+                cursor.execute("PRAGMA table_info(posted_content)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                # Check if timeframe column exists
+                if 'timeframe' not in columns:
+                    # Add the timeframe column if it doesn't exist
+                    cursor.execute("ALTER TABLE posted_content ADD COLUMN timeframe TEXT DEFAULT '1h'")
+                    conn.commit()
+                    logger.logger.info("Added missing timeframe column to posted_content table")
+                
+                # Now it's safe to create the index
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_content_timeframe ON posted_content(timeframe)")
+            except Exception as e:
+                logger.log_error("Timeframe Column Check", str(e))
+            
+            # Check if timeframe column exists in technical_indicators before creating index
+            try:
+                # Try to get column info
+                cursor.execute("PRAGMA table_info(technical_indicators)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                # Check if timeframe column exists
+                if 'timeframe' not in columns:
+                    # Add the timeframe column if it doesn't exist
+                    cursor.execute("ALTER TABLE technical_indicators ADD COLUMN timeframe TEXT DEFAULT '1h'")
+                    conn.commit()
+                    logger.logger.info("Added missing timeframe column to technical_indicators table")
+                
+                # Now it's safe to create the index
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_technical_indicators_timeframe ON technical_indicators(timeframe)")
+            except Exception as e:
+                logger.log_error("Timeframe Column Check for technical_indicators", str(e))
+            
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mood_history_timestamp ON mood_history(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mood_history_chain ON mood_history(chain)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_smart_money_timestamp ON smart_money_indicators(timestamp)")
@@ -321,9 +372,610 @@ class CryptoDatabase:
             raise
 
     #########################
-    # PREDICTION STORAGE METHODS
+    # CORE DATA STORAGE METHODS
     #########################
 
+    def store_market_data(self, chain: str, data: Dict[str, Any]) -> None:
+        """Store market data for a specific chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                INSERT INTO market_data (
+                    timestamp, chain, price, volume, price_change_24h, 
+                    market_cap, ath, ath_change_percentage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                chain,
+                data['current_price'],
+                data['volume'],
+                data['price_change_percentage_24h'],
+                data['market_cap'],
+                data['ath'],
+                data['ath_change_percentage']
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.log_error(f"Store Market Data - {chain}", str(e))
+            conn.rollback()
+
+    def store_token_correlations(self, token: str, correlations: Dict[str, Any]) -> None:
+        """Store token-specific correlation data"""
+        conn, cursor = self._get_connection()
+        try:
+            # Extract average correlations
+            avg_price_corr = correlations.get('avg_price_correlation', 0)
+            avg_volume_corr = correlations.get('avg_volume_correlation', 0)
+            
+            cursor.execute("""
+                INSERT INTO token_correlations (
+                    timestamp, token, avg_price_correlation, avg_volume_correlation, full_data
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                token,
+                avg_price_corr,
+                avg_volume_corr,
+                json.dumps(correlations)
+            ))
+            conn.commit()
+            logger.logger.debug(f"Stored correlation data for {token}")
+        except Exception as e:
+            logger.log_error(f"Store Token Correlations - {token}", str(e))
+            conn.rollback()
+            
+    def store_token_market_comparison(self, token: str, vs_market_avg_change: float,
+                                    vs_market_volume_growth: float, outperforming_market: bool,
+                                    correlations: Dict[str, Any]) -> None:
+        """Store token vs market comparison data"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                INSERT INTO token_market_comparison (
+                    timestamp, token, vs_market_avg_change, vs_market_volume_growth,
+                    outperforming_market, correlations
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                token,
+                vs_market_avg_change,
+                vs_market_volume_growth,
+                1 if outperforming_market else 0,
+                json.dumps(correlations)
+            ))
+            conn.commit()
+            logger.logger.debug(f"Stored market comparison data for {token}")
+        except Exception as e:
+            logger.log_error(f"Store Token Market Comparison - {token}", str(e))
+            conn.rollback()
+
+    def store_posted_content(self, content: str, sentiment: Dict, 
+                           trigger_type: str, price_data: Dict, 
+                           meme_phrases: Dict, is_prediction: bool = False,
+                           prediction_data: Dict = None, timeframe: str = "1h") -> None:
+        """Store posted content with metadata and timeframe"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                INSERT INTO posted_content (
+                    timestamp, content, sentiment, trigger_type, 
+                    price_data, meme_phrases, is_prediction, prediction_data, timeframe
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                content,
+                json.dumps(sentiment),
+                trigger_type,
+                json.dumps(price_data),
+                json.dumps(meme_phrases),
+                1 if is_prediction else 0,
+                json.dumps(prediction_data) if prediction_data else None,
+                timeframe
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.log_error("Store Posted Content", str(e))
+            conn.rollback()
+
+    def store_mood(self, chain: str, mood: str, indicators: Dict) -> None:
+        """Store mood data for a specific chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                INSERT INTO mood_history (
+                    timestamp, chain, mood, indicators
+                ) VALUES (?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                chain,
+                mood,
+                json.dumps(asdict(indicators) if hasattr(indicators, '__dataclass_fields__') else indicators)
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.log_error(f"Store Mood - {chain}", str(e))
+            conn.rollback()
+            
+    def store_smart_money_indicators(self, chain: str, indicators: Dict[str, Any]) -> None:
+        """Store smart money indicators for a chain"""
+        conn, cursor = self._get_connection()
+        try:
+            # Extract values with defaults for potential missing keys
+            volume_z_score = indicators.get('volume_z_score', 0.0)
+            price_volume_divergence = 1 if indicators.get('price_volume_divergence', False) else 0
+            stealth_accumulation = 1 if indicators.get('stealth_accumulation', False) else 0
+            abnormal_volume = 1 if indicators.get('abnormal_volume', False) else 0
+            volume_vs_hourly_avg = indicators.get('volume_vs_hourly_avg', 0.0)
+            volume_vs_daily_avg = indicators.get('volume_vs_daily_avg', 0.0)
+            volume_cluster_detected = 1 if indicators.get('volume_cluster_detected', False) else 0
+            
+            # Convert unusual_trading_hours to JSON if present
+            unusual_hours = json.dumps(indicators.get('unusual_trading_hours', []))
+            
+            # Store all raw data for future reference
+            raw_data = json.dumps(indicators)
+            
+            cursor.execute("""
+                INSERT INTO smart_money_indicators (
+                    timestamp, chain, volume_z_score, price_volume_divergence,
+                    stealth_accumulation, abnormal_volume, volume_vs_hourly_avg,
+                    volume_vs_daily_avg, volume_cluster_detected, unusual_trading_hours,
+                    raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                chain,
+                volume_z_score,
+                price_volume_divergence,
+                stealth_accumulation,
+                abnormal_volume,
+                volume_vs_hourly_avg,
+                volume_vs_daily_avg,
+                volume_cluster_detected,
+                unusual_hours,
+                raw_data
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.log_error(f"Store Smart Money Indicators - {chain}", str(e))
+            conn.rollback()
+            
+    def _store_json_data(self, data_type: str, data: Dict[str, Any]) -> None:
+        """Generic method to store JSON data in a generic_json_data table"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                INSERT INTO generic_json_data (
+                    timestamp, data_type, data
+                ) VALUES (?, ?, ?)
+            """, (
+                datetime.now(),
+                data_type,
+                json.dumps(data)
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.log_error(f"Store JSON Data - {data_type}", str(e))
+            conn.rollback()
+
+    #########################
+    # DATA RETRIEVAL METHODS
+    #########################
+
+    def get_recent_market_data(self, chain: str, hours: int = 24) -> List[Dict]:
+        """Get recent market data for a specific chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT * FROM market_data 
+                WHERE chain = ? 
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+                ORDER BY timestamp DESC
+            """, (chain, hours))
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.log_error(f"Get Recent Market Data - {chain}", str(e))
+            return []
+            
+    def get_token_correlations(self, token: str, hours: int = 24) -> List[Dict]:
+        """Get token-specific correlation data"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT * FROM token_correlations 
+                WHERE token = ?
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+                ORDER BY timestamp DESC
+            """, (token, hours))
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            # Parse JSON field
+            for result in results:
+                result["full_data"] = json.loads(result["full_data"]) if result["full_data"] else {}
+                
+            return results
+        except Exception as e:
+            logger.log_error(f"Get Token Correlations - {token}", str(e))
+            return []
+            
+    def get_token_market_comparison(self, token: str, hours: int = 24) -> List[Dict]:
+        """Get token vs market comparison data"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT * FROM token_market_comparison 
+                WHERE token = ?
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+                ORDER BY timestamp DESC
+            """, (token, hours))
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            # Parse JSON field
+            for result in results:
+                result["correlations"] = json.loads(result["correlations"]) if result["correlations"] else {}
+                
+            return results
+        except Exception as e:
+            logger.log_error(f"Get Token Market Comparison - {token}", str(e))
+            return []
+        
+    def get_recent_posts(self, hours: int = 24, timeframe: str = None) -> List[Dict]:
+        """
+        Get recent posted content
+        Can filter by timeframe
+        """
+        conn, cursor = self._get_connection()
+        try:
+            query = """
+                SELECT * FROM posted_content 
+                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
+            """
+            params = [hours]
+            
+            if timeframe:
+                query += " AND timeframe = ?"
+                params.append(timeframe)
+                
+            query += " ORDER BY timestamp DESC"
+            
+            cursor.execute(query, params)
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            # Parse JSON fields
+            for result in results:
+                result["sentiment"] = json.loads(result["sentiment"]) if result["sentiment"] else {}
+                result["price_data"] = json.loads(result["price_data"]) if result["price_data"] else {}
+                result["meme_phrases"] = json.loads(result["meme_phrases"]) if result["meme_phrases"] else {}
+                result["prediction_data"] = json.loads(result["prediction_data"]) if result["prediction_data"] else None
+                
+            return results
+        except Exception as e:
+            logger.log_error("Get Recent Posts", str(e))
+            return []
+
+    def get_chain_stats(self, chain: str, hours: int = 24) -> Dict[str, Any]:
+        """Get statistical summary for a chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT 
+                    AVG(price) as avg_price,
+                    MAX(price) as max_price,
+                    MIN(price) as min_price,
+                    AVG(volume) as avg_volume,
+                    MAX(volume) as max_volume,
+                    AVG(price_change_24h) as avg_price_change
+                FROM market_data 
+                WHERE chain = ? 
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+            """, (chain, hours))
+            result = cursor.fetchone()
+            if result:
+                return dict(result)
+            return {}
+        except Exception as e:
+            logger.log_error(f"Get Chain Stats - {chain}", str(e))
+            return {}
+            
+    def get_smart_money_indicators(self, chain: str, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get recent smart money indicators for a chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT * FROM smart_money_indicators
+                WHERE chain = ? 
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+                ORDER BY timestamp DESC
+            """, (chain, hours))
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            # Parse JSON fields
+            for result in results:
+                result["unusual_trading_hours"] = json.loads(result["unusual_trading_hours"]) if result["unusual_trading_hours"] else []
+                result["raw_data"] = json.loads(result["raw_data"]) if result["raw_data"] else {}
+                
+            return results
+        except Exception as e:
+            logger.log_error(f"Get Smart Money Indicators - {chain}", str(e))
+            return []
+            
+    def get_token_market_stats(self, token: str, hours: int = 24) -> Dict[str, Any]:
+        """Get statistical summary of token vs market performance"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT 
+                    AVG(vs_market_avg_change) as avg_performance_diff,
+                    AVG(vs_market_volume_growth) as avg_volume_growth_diff,
+                    SUM(CASE WHEN outperforming_market = 1 THEN 1 ELSE 0 END) as outperforming_count,
+                    COUNT(*) as total_records
+                FROM token_market_comparison
+                WHERE token = ?
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+            """, (token, hours))
+            result = cursor.fetchone()
+            if result:
+                result_dict = dict(result)
+                
+                # Calculate percentage of time outperforming
+                if result_dict['total_records'] > 0:
+                    result_dict['outperforming_percentage'] = (result_dict['outperforming_count'] / result_dict['total_records']) * 100
+                else:
+                    result_dict['outperforming_percentage'] = 0
+                    
+                return result_dict
+            return {}
+        except Exception as e:
+            logger.log_error(f"Get Token Market Stats - {token}", str(e))
+            return {}
+
+    def get_latest_smart_money_alert(self, chain: str) -> Optional[Dict[str, Any]]:
+        """Get the most recent smart money alert for a chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT * FROM smart_money_indicators
+                WHERE chain = ? 
+                AND (abnormal_volume = 1 OR stealth_accumulation = 1 OR volume_cluster_detected = 1)
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (chain,))
+            result = cursor.fetchone()
+            if result:
+                result_dict = dict(result)
+                
+                # Parse JSON fields
+                result_dict["unusual_trading_hours"] = json.loads(result_dict["unusual_trading_hours"]) if result_dict["unusual_trading_hours"] else []
+                result_dict["raw_data"] = json.loads(result_dict["raw_data"]) if result_dict["raw_data"] else {}
+                
+                return result_dict
+            return None
+        except Exception as e:
+            logger.log_error(f"Get Latest Smart Money Alert - {chain}", str(e))
+            return None
+    
+    def get_volume_trend(self, chain: str, hours: int = 24) -> Dict[str, Any]:
+        """Get volume trend analysis for a chain"""
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT 
+                    timestamp,
+                    volume
+                FROM market_data
+                WHERE chain = ? 
+                AND timestamp >= datetime('now', '-' || ? || ' hours')
+                ORDER BY timestamp ASC
+            """, (chain, hours))
+            
+            results = cursor.fetchall()
+            if not results:
+                return {'trend': 'insufficient_data', 'change': 0}
+                
+            # Calculate trend
+            volumes = [row['volume'] for row in results]
+            earliest_volume = volumes[0] if volumes else 0
+            latest_volume = volumes[-1] if volumes else 0
+            
+            if earliest_volume > 0:
+                change_pct = ((latest_volume - earliest_volume) / earliest_volume) * 100
+            else:
+                change_pct = 0
+                
+            # Determine trend description
+            if change_pct >= 15:
+                trend = "significant_increase"
+            elif change_pct <= -15:
+                trend = "significant_decrease"
+            elif change_pct >= 5:
+                trend = "moderate_increase"
+            elif change_pct <= -5:
+                trend = "moderate_decrease"
+            else:
+                trend = "stable"
+                
+            return {
+                'trend': trend,
+                'change': change_pct,
+                'earliest_volume': earliest_volume,
+                'latest_volume': latest_volume,
+                'data_points': len(volumes)
+            }
+            
+        except Exception as e:
+            logger.log_error(f"Get Volume Trend - {chain}", str(e))
+            return {'trend': 'error', 'change': 0}
+            
+    def get_top_performing_tokens(self, hours: int = 24, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get list of top performing tokens based on price change"""
+        conn, cursor = self._get_connection()
+        try:
+            # Get unique tokens in database
+            cursor.execute("""
+                SELECT DISTINCT chain
+                FROM market_data
+                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
+            """, (hours,))
+            tokens = [row['chain'] for row in cursor.fetchall()]
+            
+            results = []
+            for token in tokens:
+                # Get latest price and 24h change
+                cursor.execute("""
+                    SELECT price, price_change_24h
+                    FROM market_data
+                    WHERE chain = ?
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (token,))
+                data = cursor.fetchone()
+                
+                if data:
+                    results.append({
+                        'token': token,
+                        'price': data['price'],
+                        'price_change_24h': data['price_change_24h']
+                    })
+            
+            # Sort by price change (descending)
+            results.sort(key=lambda x: x.get('price_change_24h', 0), reverse=True)
+            
+            # Return top N tokens
+            return results[:limit]
+            
+        except Exception as e:
+            logger.log_error("Get Top Performing Tokens", str(e))
+            return []
+
+    def get_tokens_by_prediction_accuracy(self, timeframe: str = "1h", min_predictions: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get tokens sorted by prediction accuracy for a specific timeframe
+        Only includes tokens with at least min_predictions number of predictions
+        """
+        conn, cursor = self._get_connection()
+        try:
+            cursor.execute("""
+                SELECT token, accuracy_rate, total_predictions, correct_predictions
+                FROM prediction_performance
+                WHERE timeframe = ? AND total_predictions >= ?
+                ORDER BY accuracy_rate DESC
+            """, (timeframe, min_predictions))
+            
+            return [dict(row) for row in cursor.fetchall()]
+            
+        except Exception as e:
+            logger.log_error(f"Get Tokens By Prediction Accuracy - {timeframe}", str(e))
+            return []
+
+    #########################
+    # DUPLICATE DETECTION METHODS
+    #########################
+    
+    def check_content_similarity(self, content: str, timeframe: str = None) -> bool:
+        """
+        Check if similar content was recently posted
+        Can filter by timeframe
+        """
+        conn, cursor = self._get_connection()
+        try:
+            query = """
+                SELECT content FROM posted_content 
+                WHERE timestamp >= datetime('now', '-1 hour')
+            """
+            
+            params = []
+            
+            if timeframe:
+                query += " AND timeframe = ?"
+                params.append(timeframe)
+                
+            cursor.execute(query, params)
+            recent_posts = [row['content'] for row in cursor.fetchall()]
+            
+            # Simple similarity check - can be enhanced later
+            return any(content.strip() == post.strip() for post in recent_posts)
+        except Exception as e:
+            logger.log_error("Check Content Similarity", str(e))
+            return False
+            
+    def check_exact_content_match(self, content: str, timeframe: str = None) -> bool:
+        """
+        Check for exact match of content within recent posts
+        Can filter by timeframe
+        """
+        conn, cursor = self._get_connection()
+        try:
+            query = """
+                SELECT COUNT(*) as count FROM posted_content 
+                WHERE content = ? 
+                AND timestamp >= datetime('now', '-3 hours')
+            """
+            
+            params = [content]
+            
+            if timeframe:
+                query += " AND timeframe = ?"
+                params.append(timeframe)
+                
+            cursor.execute(query, params)
+            result = cursor.fetchone()
+            return result['count'] > 0 if result else False
+        except Exception as e:
+            logger.log_error("Check Exact Content Match", str(e))
+            return False
+            
+    def check_content_similarity_with_timeframe(self, content: str, hours: int = 1, timeframe: str = None) -> bool:
+        """
+        Check if similar content was posted within a specified timeframe
+        Can filter by prediction timeframe
+        """
+        conn, cursor = self._get_connection()
+        try:
+            query = """
+                SELECT content FROM posted_content 
+                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
+            """
+            
+            params = [hours]
+            
+            if timeframe:
+                query += " AND timeframe = ?"
+                params.append(timeframe)
+                
+            cursor.execute(query, params)
+            recent_posts = [row['content'] for row in cursor.fetchall()]
+            
+            # Split content into main text and hashtags
+            content_main = content.split("\n\n#")[0].lower() if "\n\n#" in content else content.lower()
+            
+            for post in recent_posts:
+                post_main = post.split("\n\n#")[0].lower() if "\n\n#" in post else post.lower()
+                
+                # Calculate similarity based on word overlap
+                content_words = set(content_main.split())
+                post_words = set(post_main.split())
+                
+                if content_words and post_words:
+                    overlap = len(content_words.intersection(post_words))
+                    similarity = overlap / max(len(content_words), len(post_words))
+                    
+                    # Consider similar if 70% or more words overlap
+                    if similarity > 0.7:
+                        return True
+            
+            return False
+        except Exception as e:
+            logger.log_error("Check Content Similarity With Timeframe", str(e))
+            return False
+
+    #########################
+    # PREDICTION METHODS
+    #########################
+    
     def store_prediction(self, token: str, prediction_data: Dict[str, Any], timeframe: str = "1h") -> int:
         """
         Store a prediction in the database
@@ -529,7 +1181,7 @@ class CryptoDatabase:
         except Exception as e:
             logger.log_error(f"Store Statistical Forecast - {token} ({timeframe})", str(e))
             conn.rollback()
-    
+
     def _store_ml_forecast(self, token: str, forecast_data: Dict[str, Any], timeframe: str = "1h") -> None:
         """Store machine learning forecast data with timeframe support"""
         conn, cursor = self._get_connection()
@@ -698,10 +1350,6 @@ class CryptoDatabase:
         except Exception as e:
             logger.log_error(f"Update Timeframe Metrics - {token} ({timeframe})", str(e))
             conn.rollback()
-
-#########################
-    # PREDICTION RETRIEVAL METHODS
-    #########################
 
     def get_active_predictions(self, token: str = None, timeframe: str = None) -> List[Dict[str, Any]]:
         """
@@ -1156,7 +1804,7 @@ class CryptoDatabase:
             logger.log_error("Get Timeframe Performance Summary", str(e))
             return {}
 
-    def get_recent_prediction_outcomes(self, token: str = None, timeframe: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_prediction_outcomes(self, token: str = None, limit: int = 10) -> List[Dict[str, Any]]:
         """
         Get recent prediction outcomes with their original predictions
         Can filter by token and/or timeframe
@@ -1176,10 +1824,6 @@ class CryptoDatabase:
             if token:
                 query += " AND p.token = ?"
                 params.append(token)
-                
-            if timeframe:
-                query += " AND p.timeframe = ?"
-                params.append(timeframe)
                 
             query += " ORDER BY o.evaluation_time DESC LIMIT ?"
             params.append(limit)
@@ -1384,11 +2028,11 @@ class CryptoDatabase:
             logger.log_error(f"Get Claude Predictions - {token}", str(e))
             return []
 
-    def get_prediction_accuracy_by_model(self, token: str = None, timeframe: str = None, days: int = 30) -> Dict[str, Any]:
+    def get_prediction_accuracy_by_model(self, timeframe: str = None, days: int = 30) -> Dict[str, Any]:
         """
         Calculate prediction accuracy statistics by model type
         Returns accuracy metrics for different prediction approaches
-        Can filter by token and/or timeframe
+        Can filter by timeframe
         """
         conn, cursor = self._get_connection()
         
@@ -1403,10 +2047,6 @@ class CryptoDatabase:
             """
             params = [days]
             
-            if token:
-                query += " AND p.token = ?"
-                params.append(token)
-                
             if timeframe:
                 query += " AND p.timeframe = ?"
                 params.append(timeframe)
@@ -1588,623 +2228,6 @@ class CryptoDatabase:
         except Exception as e:
             logger.log_error(f"Get Prediction Comparison Across Timeframes - {token}", str(e))
             return {}
-
-    def _get_recent_market_data(self, chain: str, hours: int = 1) -> List[Dict]:
-        """Get very recent market data for a specific chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT * FROM market_data 
-                WHERE chain = ? 
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (chain, hours))
-            return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.log_error(f"Get Recent Market Data - {chain}", str(e))
-            return []
-
-#########################
-    # CORE DATA STORAGE METHODS
-    #########################
-
-    def store_market_data(self, chain: str, data: Dict[str, Any]) -> None:
-        """Store market data for a specific chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                INSERT INTO market_data (
-                    timestamp, chain, price, volume, price_change_24h, 
-                    market_cap, ath, ath_change_percentage
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now(),
-                chain,
-                data['current_price'],
-                data['volume'],
-                data['price_change_percentage_24h'],
-                data['market_cap'],
-                data['ath'],
-                data['ath_change_percentage']
-            ))
-            conn.commit()
-        except Exception as e:
-            logger.log_error(f"Store Market Data - {chain}", str(e))
-            conn.rollback()
-
-    def store_token_correlations(self, token: str, correlations: Dict[str, Any]) -> None:
-        """Store token-specific correlation data"""
-        conn, cursor = self._get_connection()
-        try:
-            # Extract average correlations
-            avg_price_corr = correlations.get('avg_price_correlation', 0)
-            avg_volume_corr = correlations.get('avg_volume_correlation', 0)
-            
-            cursor.execute("""
-                INSERT INTO token_correlations (
-                    timestamp, token, avg_price_correlation, avg_volume_correlation, full_data
-                ) VALUES (?, ?, ?, ?, ?)
-            """, (
-                datetime.now(),
-                token,
-                avg_price_corr,
-                avg_volume_corr,
-                json.dumps(correlations)
-            ))
-            conn.commit()
-            logger.logger.debug(f"Stored correlation data for {token}")
-        except Exception as e:
-            logger.log_error(f"Store Token Correlations - {token}", str(e))
-            conn.rollback()
-            
-    def store_token_market_comparison(self, token: str, vs_market_avg_change: float,
-                                    vs_market_volume_growth: float, outperforming_market: bool,
-                                    correlations: Dict[str, Any]) -> None:
-        """Store token vs market comparison data"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                INSERT INTO token_market_comparison (
-                    timestamp, token, vs_market_avg_change, vs_market_volume_growth,
-                    outperforming_market, correlations
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now(),
-                token,
-                vs_market_avg_change,
-                vs_market_volume_growth,
-                1 if outperforming_market else 0,
-                json.dumps(correlations)
-            ))
-            conn.commit()
-            logger.logger.debug(f"Stored market comparison data for {token}")
-        except Exception as e:
-            logger.log_error(f"Store Token Market Comparison - {token}", str(e))
-            conn.rollback()
-
-    def store_posted_content(self, content: str, sentiment: Dict, 
-                           trigger_type: str, price_data: Dict, 
-                           meme_phrases: Dict, is_prediction: bool = False,
-                           prediction_data: Dict = None, timeframe: str = "1h") -> None:
-        """Store posted content with metadata and timeframe"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                INSERT INTO posted_content (
-                    timestamp, content, sentiment, trigger_type, 
-                    price_data, meme_phrases, is_prediction, prediction_data, timeframe
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now(),
-                content,
-                json.dumps(sentiment),
-                trigger_type,
-                json.dumps(price_data),
-                json.dumps(meme_phrases),
-                1 if is_prediction else 0,
-                json.dumps(prediction_data) if prediction_data else None,
-                timeframe
-            ))
-            conn.commit()
-        except Exception as e:
-            logger.log_error("Store Posted Content", str(e))
-            conn.rollback()
-
-    def store_mood(self, chain: str, mood: str, indicators: Dict) -> None:
-        """Store mood data for a specific chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                INSERT INTO mood_history (
-                    timestamp, chain, mood, indicators
-                ) VALUES (?, ?, ?, ?)
-            """, (
-                datetime.now(),
-                chain,
-                mood,
-                json.dumps(asdict(indicators) if hasattr(indicators, '__dataclass_fields__') else indicators)
-            ))
-            conn.commit()
-        except Exception as e:
-            logger.log_error(f"Store Mood - {chain}", str(e))
-            conn.rollback()
-            
-    def store_smart_money_indicators(self, chain: str, indicators: Dict[str, Any]) -> None:
-        """Store smart money indicators for a chain"""
-        conn, cursor = self._get_connection()
-        try:
-            # Extract values with defaults for potential missing keys
-            volume_z_score = indicators.get('volume_z_score', 0.0)
-            price_volume_divergence = 1 if indicators.get('price_volume_divergence', False) else 0
-            stealth_accumulation = 1 if indicators.get('stealth_accumulation', False) else 0
-            abnormal_volume = 1 if indicators.get('abnormal_volume', False) else 0
-            volume_vs_hourly_avg = indicators.get('volume_vs_hourly_avg', 0.0)
-            volume_vs_daily_avg = indicators.get('volume_vs_daily_avg', 0.0)
-            volume_cluster_detected = 1 if indicators.get('volume_cluster_detected', False) else 0
-            
-            # Convert unusual_trading_hours to JSON if present
-            unusual_hours = json.dumps(indicators.get('unusual_trading_hours', []))
-            
-            # Store all raw data for future reference
-            raw_data = json.dumps(indicators)
-            
-            cursor.execute("""
-                INSERT INTO smart_money_indicators (
-                    timestamp, chain, volume_z_score, price_volume_divergence,
-                    stealth_accumulation, abnormal_volume, volume_vs_hourly_avg,
-                    volume_vs_daily_avg, volume_cluster_detected, unusual_trading_hours,
-                    raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now(),
-                chain,
-                volume_z_score,
-                price_volume_divergence,
-                stealth_accumulation,
-                abnormal_volume,
-                volume_vs_hourly_avg,
-                volume_vs_daily_avg,
-                volume_cluster_detected,
-                unusual_hours,
-                raw_data
-            ))
-            conn.commit()
-        except Exception as e:
-            logger.log_error(f"Store Smart Money Indicators - {chain}", str(e))
-            conn.rollback()
-            
-    def _store_json_data(self, data_type: str, data: Dict[str, Any]) -> None:
-        """Generic method to store JSON data in a generic_json_data table"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                INSERT INTO generic_json_data (
-                    timestamp, data_type, data
-                ) VALUES (?, ?, ?)
-            """, (
-                datetime.now(),
-                data_type,
-                json.dumps(data)
-            ))
-            conn.commit()
-        except Exception as e:
-            logger.log_error(f"Store JSON Data - {data_type}", str(e))
-            conn.rollback()
-
-    #########################
-    # DATA RETRIEVAL METHODS
-    #########################
-
-    def get_recent_market_data(self, chain: str, hours: int = 24) -> List[Dict]:
-        """Get recent market data for a specific chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT * FROM market_data 
-                WHERE chain = ? 
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-                ORDER BY timestamp DESC
-            """, (chain, hours))
-            return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.log_error(f"Get Recent Market Data - {chain}", str(e))
-            return []
-            
-    def get_token_correlations(self, token: str, hours: int = 24) -> List[Dict]:
-        """Get token-specific correlation data"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT * FROM token_correlations 
-                WHERE token = ?
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-                ORDER BY timestamp DESC
-            """, (token, hours))
-            
-            results = [dict(row) for row in cursor.fetchall()]
-            
-            # Parse JSON field
-            for result in results:
-                result["full_data"] = json.loads(result["full_data"]) if result["full_data"] else {}
-                
-            return results
-        except Exception as e:
-            logger.log_error(f"Get Token Correlations - {token}", str(e))
-            return []
-            
-    def get_token_market_comparison(self, token: str, hours: int = 24) -> List[Dict]:
-        """Get token vs market comparison data"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT * FROM token_market_comparison 
-                WHERE token = ?
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-                ORDER BY timestamp DESC
-            """, (token, hours))
-            
-            results = [dict(row) for row in cursor.fetchall()]
-            
-            # Parse JSON field
-            for result in results:
-                result["correlations"] = json.loads(result["correlations"]) if result["correlations"] else {}
-                
-            return results
-        except Exception as e:
-            logger.log_error(f"Get Token Market Comparison - {token}", str(e))
-            return []
-
-    def get_recent_posts(self, hours: int = 24, timeframe: str = None) -> List[Dict]:
-        """
-        Get recent posted content
-        Can filter by timeframe
-        """
-        conn, cursor = self._get_connection()
-        try:
-            query = """
-                SELECT * FROM posted_content 
-                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
-            """
-            params = [hours]
-            
-            if timeframe:
-                query += " AND timeframe = ?"
-                params.append(timeframe)
-                
-            query += " ORDER BY timestamp DESC"
-            
-            cursor.execute(query, params)
-            
-            results = [dict(row) for row in cursor.fetchall()]
-            
-            # Parse JSON fields
-            for result in results:
-                result["sentiment"] = json.loads(result["sentiment"]) if result["sentiment"] else {}
-                result["price_data"] = json.loads(result["price_data"]) if result["price_data"] else {}
-                result["meme_phrases"] = json.loads(result["meme_phrases"]) if result["meme_phrases"] else {}
-                result["prediction_data"] = json.loads(result["prediction_data"]) if result["prediction_data"] else None
-                
-            return results
-        except Exception as e:
-            logger.log_error("Get Recent Posts", str(e))
-            return []
-
-    def get_chain_stats(self, chain: str, hours: int = 24) -> Dict[str, Any]:
-        """Get statistical summary for a chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT 
-                    AVG(price) as avg_price,
-                    MAX(price) as max_price,
-                    MIN(price) as min_price,
-                    AVG(volume) as avg_volume,
-                    MAX(volume) as max_volume,
-                    AVG(price_change_24h) as avg_price_change
-                FROM market_data 
-                WHERE chain = ? 
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-            """, (chain, hours))
-            result = cursor.fetchone()
-            if result:
-                return dict(result)
-            return {}
-        except Exception as e:
-            logger.log_error(f"Get Chain Stats - {chain}", str(e))
-            return {}
-            
-    def get_smart_money_indicators(self, chain: str, hours: int = 24) -> List[Dict[str, Any]]:
-        """Get recent smart money indicators for a chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT * FROM smart_money_indicators
-                WHERE chain = ? 
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-                ORDER BY timestamp DESC
-            """, (chain, hours))
-            
-            results = [dict(row) for row in cursor.fetchall()]
-            
-            # Parse JSON fields
-            for result in results:
-                result["unusual_trading_hours"] = json.loads(result["unusual_trading_hours"]) if result["unusual_trading_hours"] else []
-                result["raw_data"] = json.loads(result["raw_data"]) if result["raw_data"] else {}
-                
-            return results
-        except Exception as e:
-            logger.log_error(f"Get Smart Money Indicators - {chain}", str(e))
-            return []
-            
-    def get_token_market_stats(self, token: str, hours: int = 24) -> Dict[str, Any]:
-        """Get statistical summary of token vs market performance"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT 
-                    AVG(vs_market_avg_change) as avg_performance_diff,
-                    AVG(vs_market_volume_growth) as avg_volume_growth_diff,
-                    SUM(CASE WHEN outperforming_market = 1 THEN 1 ELSE 0 END) as outperforming_count,
-                    COUNT(*) as total_records
-                FROM token_market_comparison
-                WHERE token = ?
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-            """, (token, hours))
-            result = cursor.fetchone()
-            if result:
-                result_dict = dict(result)
-                
-                # Calculate percentage of time outperforming
-                if result_dict['total_records'] > 0:
-                    result_dict['outperforming_percentage'] = (result_dict['outperforming_count'] / result_dict['total_records']) * 100
-                else:
-                    result_dict['outperforming_percentage'] = 0
-                    
-                return result_dict
-            return {}
-        except Exception as e:
-            logger.log_error(f"Get Token Market Stats - {token}", str(e))
-            return {}
-
-    def get_latest_smart_money_alert(self, chain: str) -> Optional[Dict[str, Any]]:
-        """Get the most recent smart money alert for a chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT * FROM smart_money_indicators
-                WHERE chain = ? 
-                AND (abnormal_volume = 1 OR stealth_accumulation = 1 OR volume_cluster_detected = 1)
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (chain,))
-            result = cursor.fetchone()
-            if result:
-                result_dict = dict(result)
-                
-                # Parse JSON fields
-                result_dict["unusual_trading_hours"] = json.loads(result_dict["unusual_trading_hours"]) if result_dict["unusual_trading_hours"] else []
-                result_dict["raw_data"] = json.loads(result_dict["raw_data"]) if result_dict["raw_data"] else {}
-                
-                return result_dict
-            return None
-        except Exception as e:
-            logger.log_error(f"Get Latest Smart Money Alert - {chain}", str(e))
-            return None
-    
-    def get_volume_trend(self, chain: str, hours: int = 24) -> Dict[str, Any]:
-        """Get volume trend analysis for a chain"""
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT 
-                    timestamp,
-                    volume
-                FROM market_data
-                WHERE chain = ? 
-                AND timestamp >= datetime('now', '-' || ? || ' hours')
-                ORDER BY timestamp ASC
-            """, (chain, hours))
-            
-            results = cursor.fetchall()
-            if not results:
-                return {'trend': 'insufficient_data', 'change': 0}
-                
-            # Calculate trend
-            volumes = [row['volume'] for row in results]
-            earliest_volume = volumes[0] if volumes else 0
-            latest_volume = volumes[-1] if volumes else 0
-            
-            if earliest_volume > 0:
-                change_pct = ((latest_volume - earliest_volume) / earliest_volume) * 100
-            else:
-                change_pct = 0
-                
-            # Determine trend description
-            if change_pct >= 15:
-                trend = "significant_increase"
-            elif change_pct <= -15:
-                trend = "significant_decrease"
-            elif change_pct >= 5:
-                trend = "moderate_increase"
-            elif change_pct <= -5:
-                trend = "moderate_decrease"
-            else:
-                trend = "stable"
-                
-            return {
-                'trend': trend,
-                'change': change_pct,
-                'earliest_volume': earliest_volume,
-                'latest_volume': latest_volume,
-                'data_points': len(volumes)
-            }
-            
-        except Exception as e:
-            logger.log_error(f"Get Volume Trend - {chain}", str(e))
-            return {'trend': 'error', 'change': 0}
-            
-    def get_top_performing_tokens(self, hours: int = 24, limit: int = 5) -> List[Dict[str, Any]]:
-        """Get list of top performing tokens based on price change"""
-        conn, cursor = self._get_connection()
-        try:
-            # Get unique tokens in database
-            cursor.execute("""
-                SELECT DISTINCT chain
-                FROM market_data
-                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
-            """, (hours,))
-            tokens = [row['chain'] for row in cursor.fetchall()]
-            
-            results = []
-            for token in tokens:
-                # Get latest price and 24h change
-                cursor.execute("""
-                    SELECT price, price_change_24h
-                    FROM market_data
-                    WHERE chain = ?
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                """, (token,))
-                data = cursor.fetchone()
-                
-                if data:
-                    results.append({
-                        'token': token,
-                        'price': data['price'],
-                        'price_change_24h': data['price_change_24h']
-                    })
-            
-            # Sort by price change (descending)
-            results.sort(key=lambda x: x.get('price_change_24h', 0), reverse=True)
-            
-            # Return top N tokens
-            return results[:limit]
-            
-        except Exception as e:
-            logger.log_error("Get Top Performing Tokens", str(e))
-            return []
-
-    def get_tokens_by_prediction_accuracy(self, timeframe: str = "1h", min_predictions: int = 5) -> List[Dict[str, Any]]:
-        """
-        Get tokens sorted by prediction accuracy for a specific timeframe
-        Only includes tokens with at least min_predictions number of predictions
-        """
-        conn, cursor = self._get_connection()
-        try:
-            cursor.execute("""
-                SELECT token, accuracy_rate, total_predictions, correct_predictions
-                FROM prediction_performance
-                WHERE timeframe = ? AND total_predictions >= ?
-                ORDER BY accuracy_rate DESC
-            """, (timeframe, min_predictions))
-            
-            return [dict(row) for row in cursor.fetchall()]
-            
-        except Exception as e:
-            logger.log_error(f"Get Tokens By Prediction Accuracy - {timeframe}", str(e))
-            return []
-
-    #########################
-    # DUPLICATE DETECTION METHODS
-    #########################
-    
-    def check_content_similarity(self, content: str, timeframe: str = None) -> bool:
-        """
-        Check if similar content was recently posted
-        Can filter by timeframe
-        """
-        conn, cursor = self._get_connection()
-        try:
-            query = """
-                SELECT content FROM posted_content 
-                WHERE timestamp >= datetime('now', '-1 hour')
-            """
-            
-            params = []
-            
-            if timeframe:
-                query += " AND timeframe = ?"
-                params.append(timeframe)
-                
-            cursor.execute(query, params)
-            recent_posts = [row['content'] for row in cursor.fetchall()]
-            
-            # Simple similarity check - can be enhanced later
-            return any(content.strip() == post.strip() for post in recent_posts)
-        except Exception as e:
-            logger.log_error("Check Content Similarity", str(e))
-            return False
-            
-    def check_exact_content_match(self, content: str, timeframe: str = None) -> bool:
-        """
-        Check for exact match of content within recent posts
-        Can filter by timeframe
-        """
-        conn, cursor = self._get_connection()
-        try:
-            query = """
-                SELECT COUNT(*) as count FROM posted_content 
-                WHERE content = ? 
-                AND timestamp >= datetime('now', '-3 hours')
-            """
-            
-            params = [content]
-            
-            if timeframe:
-                query += " AND timeframe = ?"
-                params.append(timeframe)
-                
-            cursor.execute(query, params)
-            result = cursor.fetchone()
-            return result['count'] > 0 if result else False
-        except Exception as e:
-            logger.log_error("Check Exact Content Match", str(e))
-            return False
-            
-    def check_content_similarity_with_timeframe(self, content: str, hours: int = 1, timeframe: str = None) -> bool:
-        """
-        Check if similar content was posted within a specified timeframe
-        Can filter by prediction timeframe
-        """
-        conn, cursor = self._get_connection()
-        try:
-            query = """
-                SELECT content FROM posted_content 
-                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
-            """
-            
-            params = [hours]
-            
-            if timeframe:
-                query += " AND timeframe = ?"
-                params.append(timeframe)
-                
-            cursor.execute(query, params)
-            recent_posts = [row['content'] for row in cursor.fetchall()]
-            
-            # Split content into main text and hashtags
-            content_main = content.split("\n\n#")[0].lower() if "\n\n#" in content else content.lower()
-            
-            for post in recent_posts:
-                post_main = post.split("\n\n#")[0].lower() if "\n\n#" in post else post.lower()
-                
-                # Calculate similarity based on word overlap
-                content_words = set(content_main.split())
-                post_words = set(post_main.split())
-                
-                if content_words and post_words:
-                    overlap = len(content_words.intersection(post_words))
-                    similarity = overlap / max(len(content_words), len(post_words))
-                    
-                    # Consider similar if 70% or more words overlap
-                    if similarity > 0.7:
-                        return True
-            
-            return False
-        except Exception as e:
-            logger.log_error("Check Content Similarity With Timeframe", str(e))
-            return False
 
     #########################
     # DATABASE MAINTENANCE METHODS
@@ -2456,4 +2479,4 @@ class CryptoDatabase:
         if self.conn:
             self.conn.close()
             self.conn = None
-            self.cursor = None                    
+            self.cursor = None                     
