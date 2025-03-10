@@ -299,8 +299,8 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_ichimoku(prices: List[float], highs: List[float], lows: List[float], 
-                         tenkan_period: int = 9, kijun_period: int = 26, 
-                         senkou_b_period: int = 52) -> Dict[str, float]:
+                          tenkan_period: int = 9, kijun_period: int = 26, 
+                          senkou_b_period: int = 52) -> Dict[str, float]:
         """
         Calculate Ichimoku Cloud components
         Returns key Ichimoku components
@@ -312,25 +312,34 @@ class TechnicalIndicators:
                 "senkou_span_a": prices[-1] if prices else 0, 
                 "senkou_span_b": prices[-1] if prices else 0
             }
-            
+    
+        # Safe default for empty sequences (last price)
+        default_value = prices[-1] if prices else 0
+        
         # Calculate Tenkan-sen (Conversion Line)
-        high_tenkan = max(highs[-tenkan_period:])
-        low_tenkan = min(lows[-tenkan_period:])
+        tenkan_highs = highs[-tenkan_period:]
+        tenkan_lows = lows[-tenkan_period:]
+        high_tenkan = max(tenkan_highs) if tenkan_highs else default_value
+        low_tenkan = min(tenkan_lows) if tenkan_lows else default_value
         tenkan_sen = (high_tenkan + low_tenkan) / 2
-        
+    
         # Calculate Kijun-sen (Base Line)
-        high_kijun = max(highs[-kijun_period:])
-        low_kijun = min(lows[-kijun_period:])
+        kijun_highs = highs[-kijun_period:]
+        kijun_lows = lows[-kijun_period:]
+        high_kijun = max(kijun_highs) if kijun_highs else default_value
+        low_kijun = min(kijun_lows) if kijun_lows else default_value
         kijun_sen = (high_kijun + low_kijun) / 2
-        
+    
         # Calculate Senkou Span A (Leading Span A)
         senkou_span_a = (tenkan_sen + kijun_sen) / 2
-        
+    
         # Calculate Senkou Span B (Leading Span B)
-        high_senkou = max(highs[-senkou_b_period:])
-        low_senkou = min(lows[-senkou_b_period:])
+        senkou_highs = highs[-senkou_b_period:]
+        senkou_lows = lows[-senkou_b_period:]
+        high_senkou = max(senkou_highs) if senkou_highs else default_value
+        low_senkou = min(senkou_lows) if senkou_lows else default_value
         senkou_span_b = (high_senkou + low_senkou) / 2
-        
+    
         return {
             "tenkan_sen": tenkan_sen,
             "kijun_sen": kijun_sen,
@@ -385,9 +394,26 @@ class TechnicalIndicators:
         Analyze multiple technical indicators and return results with interpretations
         Adjusted for different timeframes (1h, 24h, 7d)
         """
-        if not prices or len(prices) < 26:
-            return {"error": "Insufficient price data for technical analysis"}
-            
+        # Define minimum required data points for reliable technical analysis
+        min_required = {'1h': 24, '24h': 48, '7d': 60}
+        required_points = min_required.get(timeframe, 24)
+    
+        if not prices or len(prices) < required_points:
+            logger.logger.warning(f"Insufficient data for {timeframe} technical analysis: {len(prices) if prices else 0} points available, {required_points} required")
+            return {
+                "overall_trend": "neutral",
+                "trend_strength": 50,
+                "volatility": 5.0,
+                "signals": {
+                    "rsi": "neutral",
+                    "macd": "neutral",
+                    "bollinger_bands": "neutral",
+                    "stochastic": "neutral"
+                },
+                "insufficient_data": True,
+                "timeframe": timeframe
+            }
+        
         # Use closing prices for highs/lows if not provided
         if highs is None:
             highs = prices
@@ -2523,4 +2549,4 @@ class PredictionEngine:
             
         except Exception as e:
             logger.log_error("Get Model Accuracy By Timeframe", str(e))
-            return {}
+            return {}   
