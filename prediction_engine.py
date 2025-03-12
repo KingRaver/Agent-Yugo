@@ -27,6 +27,17 @@ class TechnicalIndicators:
     """Class for calculating technical indicators"""
     
     @staticmethod
+    def safe_max(sequence, default=None):
+        """Safely get maximum value from a sequence, returning default if empty"""
+        return max(sequence) if sequence else default
+
+    @staticmethod
+    def safe_min(sequence, default=None):
+        """Safely get minimum value from a sequence, returning default if empty"""
+        return min(sequence) if sequence else default
+    
+    # All existing methods below...
+    @staticmethod
     def calculate_rsi(prices: List[float], period: int = 14) -> float:
         """
         Calculate Relative Strength Index
@@ -141,11 +152,11 @@ class TechnicalIndicators:
         recent_prices = prices[-k_period:]
         recent_highs = highs[-k_period:]
         recent_lows = lows[-k_period:]
-        
+
         # Calculate %K
-        current_close = recent_prices[-1]
-        highest_high = max(recent_highs)
-        lowest_low = min(recent_lows)
+        current_close = recent_prices[-1] if recent_prices else prices[-1]  # Default to last price if empty
+        highest_high = TechnicalIndicators.safe_max(recent_highs, default=current_close)
+        lowest_low = TechnicalIndicators.safe_min(recent_lows, default=current_close)
         
         if highest_high == lowest_low:
             k = 50.0  # Default if there's no range
@@ -184,9 +195,9 @@ class TechnicalIndicators:
             return {}
             
         # Create price bins
-        min_price = min(prices)
-        max_price = max(prices)
-        
+        min_price = TechnicalIndicators.safe_min(prices, default=0)
+        max_price = TechnicalIndicators.safe_max(prices, default=0)
+
         if min_price == max_price:
             return {str(min_price): 100.0}
             
@@ -299,8 +310,8 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_ichimoku(prices: List[float], highs: List[float], lows: List[float], 
-                          tenkan_period: int = 9, kijun_period: int = 26, 
-                          senkou_b_period: int = 52) -> Dict[str, float]:
+                         tenkan_period: int = 9, kijun_period: int = 26, 
+                         senkou_b_period: int = 52) -> Dict[str, float]:
         """
         Calculate Ichimoku Cloud components
         Returns key Ichimoku components
@@ -312,34 +323,26 @@ class TechnicalIndicators:
                 "senkou_span_a": prices[-1] if prices else 0, 
                 "senkou_span_b": prices[-1] if prices else 0
             }
-    
-        # Safe default for empty sequences (last price)
-        default_value = prices[-1] if prices else 0
         
         # Calculate Tenkan-sen (Conversion Line)
-        tenkan_highs = highs[-tenkan_period:]
-        tenkan_lows = lows[-tenkan_period:]
-        high_tenkan = max(tenkan_highs) if tenkan_highs else default_value
-        low_tenkan = min(tenkan_lows) if tenkan_lows else default_value
+        default_value = prices[-1] if prices else 0  # Default to last price or 0
+        high_tenkan = TechnicalIndicators.safe_max(highs[-tenkan_period:], default=default_value)
+        low_tenkan = TechnicalIndicators.safe_min(lows[-tenkan_period:], default=default_value)
         tenkan_sen = (high_tenkan + low_tenkan) / 2
-    
+
         # Calculate Kijun-sen (Base Line)
-        kijun_highs = highs[-kijun_period:]
-        kijun_lows = lows[-kijun_period:]
-        high_kijun = max(kijun_highs) if kijun_highs else default_value
-        low_kijun = min(kijun_lows) if kijun_lows else default_value
+        high_kijun = TechnicalIndicators.safe_max(highs[-kijun_period:], default=default_value)
+        low_kijun = TechnicalIndicators.safe_min(lows[-kijun_period:], default=default_value)
         kijun_sen = (high_kijun + low_kijun) / 2
-    
+
         # Calculate Senkou Span A (Leading Span A)
         senkou_span_a = (tenkan_sen + kijun_sen) / 2
-    
+
         # Calculate Senkou Span B (Leading Span B)
-        senkou_highs = highs[-senkou_b_period:]
-        senkou_lows = lows[-senkou_b_period:]
-        high_senkou = max(senkou_highs) if senkou_highs else default_value
-        low_senkou = min(senkou_lows) if senkou_lows else default_value
+        high_senkou = TechnicalIndicators.safe_max(highs[-senkou_b_period:], default=default_value)
+        low_senkou = TechnicalIndicators.safe_min(lows[-senkou_b_period:], default=default_value)
         senkou_span_b = (high_senkou + low_senkou) / 2
-    
+        
         return {
             "tenkan_sen": tenkan_sen,
             "kijun_sen": kijun_sen,
@@ -394,26 +397,9 @@ class TechnicalIndicators:
         Analyze multiple technical indicators and return results with interpretations
         Adjusted for different timeframes (1h, 24h, 7d)
         """
-        # Define minimum required data points for reliable technical analysis
-        min_required = {'1h': 24, '24h': 48, '7d': 60}
-        required_points = min_required.get(timeframe, 24)
-    
-        if not prices or len(prices) < required_points:
-            logger.logger.warning(f"Insufficient data for {timeframe} technical analysis: {len(prices) if prices else 0} points available, {required_points} required")
-            return {
-                "overall_trend": "neutral",
-                "trend_strength": 50,
-                "volatility": 5.0,
-                "signals": {
-                    "rsi": "neutral",
-                    "macd": "neutral",
-                    "bollinger_bands": "neutral",
-                    "stochastic": "neutral"
-                },
-                "insufficient_data": True,
-                "timeframe": timeframe
-            }
-        
+        if not prices or len(prices) < 26:
+            return {"error": "Insufficient price data for technical analysis"}
+            
         # Use closing prices for highs/lows if not provided
         if highs is None:
             highs = prices
@@ -465,8 +451,8 @@ class TechnicalIndicators:
             # Calculate Pivot Points for key support/resistance levels
             # Use recent high, low, close for pivot calculation
             if len(prices) >= 5:
-                high = max(highs[-5:])
-                low = min(lows[-5:])
+                high = TechnicalIndicators.safe_max(highs[-5:], default=prices[-1])
+                low = TechnicalIndicators.safe_min(lows[-5:], default=prices[-1])
                 close = prices[-1]
                 pivot_type = "fibonacci" if timeframe == "7d" else "standard"
                 pivots = TechnicalIndicators.calculate_pivot_points(high, low, close, pivot_type)
@@ -2549,4 +2535,4 @@ class PredictionEngine:
             
         except Exception as e:
             logger.log_error("Get Model Accuracy By Timeframe", str(e))
-            return {}   
+            return {}
